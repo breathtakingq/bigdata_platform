@@ -1,0 +1,215 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: bigdata-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: bigdata-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: bigdata-kafka-ui
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: bigdata-kafka
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "18090:8080"
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: bigdata-namenode
+    environment:
+      CLUSTER_NAME: bigdata-cluster
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      HDFS_CONF_dfs_permissions_enabled: "false"
+    ports:
+      - "9870:9870"
+      - "8020:8020"
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: bigdata-datanode
+    depends_on:
+      - namenode
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      HDFS_CONF_dfs_permissions_enabled: "false"
+      SERVICE_PRECONDITION: namenode:9870
+    ports:
+      - "9864:9864"
+    volumes:
+      - datanode_data:/hadoop/dfs/data
+
+  hdfs-init:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: bigdata-hdfs-init
+    depends_on:
+      - namenode
+      - datanode
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      HDFS_CONF_dfs_permissions_enabled: "false"
+    entrypoint:
+      - /bin/bash
+      - -c
+    command:
+      - hdfs dfs -mkdir -p /hdfs/logs /hdfs/checkpoints/raw /hdfs/checkpoints/aggregates && hdfs dfs -chmod -R 777 /hdfs
+    restart: "no"
+
+  cassandra:
+    image: cassandra:4.1
+    container_name: bigdata-cassandra
+    environment:
+      CASSANDRA_CLUSTER_NAME: bigdata-cassandra
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_RACK: rack1
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+      - ./cassandra/init.cql:/docker-entrypoint-initdb.d/init.cql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces'"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: bigdata-cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./cassandra/init.cql:/init.cql:ro
+    command: ["cqlsh", "cassandra", "9042", "-f", "/init.cql"]
+    restart: "no"
+
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: bigdata-spark-master
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "18080:8080"
+      - "7077:7077"
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: bigdata-spark-worker
+    depends_on:
+      - spark-master
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "2"
+      - --memory
+      - 2G
+
+  spark-streaming:
+    image: apache/spark:3.5.1
+    container_name: bigdata-spark-streaming
+    depends_on:
+      kafka:
+        condition: service_started
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+      hdfs-init:
+        condition: service_completed_successfully
+      cassandra-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: microservice_logs
+      HDFS_RAW_PATH: hdfs://namenode:8020/hdfs/logs
+      HDFS_CHECKPOINT_RAW: hdfs://namenode:8020/hdfs/checkpoints/raw
+      HDFS_CHECKPOINT_AGG: hdfs://namenode:8020/hdfs/checkpoints/aggregates
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_KEYSPACE: microservice_metrics
+    volumes:
+      - ./spark/jobs:/opt/spark/jobs:ro
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.datastax.spark:spark-cassandra-connector_2.12:3.5.1
+      - --conf
+      - spark.cassandra.connection.host=cassandra
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy
+      - /opt/spark/jobs/streaming_app.py
+
+  generator:
+    build:
+      context: ./generator
+    container_name: bigdata-generator
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: microservice_logs
+      EVENTS_PER_SECOND: 5
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: bigdata-grafana
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: hadesarchitect-cassandra-datasource
+    ports:
+      - "13000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+volumes:
+  namenode_data:
+  datanode_data:
+  cassandra_data:
+  grafana_data:
